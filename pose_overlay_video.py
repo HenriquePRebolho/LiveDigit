@@ -30,13 +30,9 @@ COCO_KEYPOINT_EDGES = (
     (2, 4),
 )
 
-DEFAULT_STAGE_ROI = "0.18,0.04,0.94,0.62"
-DEFAULT_CONCERT_VIDEO_BOXES = (
-    "0.30,0.31,0.13,0.31",  # pianist
-    "0.55,0.23,0.08,0.36",  # double bass player
-    "0.66,0.21,0.11,0.42",  # saxophonist
-    "0.76,0.25,0.15,0.35",  # drummer, partially occluded by kit
-)
+# Leave empty by default because the camera may move or zoom. If a future camera
+# is fixed, you can still pass --stage-roi to ignore audience areas.
+DEFAULT_STAGE_ROI = ""
 
 KEYPOINT_COLORS = (
     (0, 255, 255),
@@ -63,7 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render a copy of a concert video with multi-person pose skeleton overlays."
     )
-    parser.add_argument("--input", type=Path, default=Path("concertVideo.mov"), help="Input concert video path.")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path("input") / "concertVideo.mov",
+        help="Input concert video path.",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -72,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--detector-model",
-        default="ustc-community/dfine-nano-coco",
+        default="ustc-community/dfine-small-coco",
         help="Hugging Face object detector. D-FINE COCO checkpoints are Apache-2.0.",
     )
     parser.add_argument(
@@ -98,21 +99,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detector-stride",
         type=int,
-        default=6,
-        help="Run person detection every N frames and reuse boxes between detections. 1 is most accurate.",
+        default=2,
+        help="Run person detection every N frames and reuse boxes between detections. 1 follows camera motion best.",
     )
     parser.add_argument(
         "--max-people",
         type=int,
-        default=4,
+        default=8,
         help="Maximum number of people to pose-estimate per frame, sorted by detection confidence.",
+    )
+    parser.add_argument(
+        "--box-smoothing",
+        type=float,
+        default=0.25,
+        help=(
+            "Smooth detected person boxes over time. 0 uses raw detections; higher values reduce jitter but react "
+            "slower to fast camera moves."
+        ),
     )
     parser.add_argument(
         "--stage-roi",
         default=DEFAULT_STAGE_ROI,
         help=(
             "Stage region as x1,y1,x2,y2. Values in 0..1 are relative to the inference frame. "
-            "Use an empty string to disable. Default focuses on the musicians and removes most audience detections."
+            "Empty by default so detections can adapt to camera movement and zoom."
         ),
     )
     parser.add_argument(
@@ -121,19 +131,13 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Extra calibrated person box as x,y,w,h. Values in 0..1 are relative to the inference frame. "
-            "Can be repeated."
+            "Can be repeated. Optional fallback only; no boxes are hard-coded by default."
         ),
-    )
-    parser.add_argument(
-        "--box-preset",
-        choices=("concert-video", "none"),
-        default="concert-video",
-        help="Use calibrated performer boxes for the provided concertVideo.mov, or rely only on detection.",
     )
     parser.add_argument(
         "--skip-detector",
         action="store_true",
-        help="Use only calibrated boxes. This is fastest and most stable for fixed-camera live streams.",
+        help="Use only boxes passed with --extra-person-box. Useful only for fixed-camera debugging.",
     )
     parser.add_argument(
         "--limit-frames",
@@ -208,6 +212,64 @@ def filter_boxes_to_roi(boxes_coco: np.ndarray, roi_xyxy: np.ndarray | None) -> 
     centers_y = boxes_coco[:, 1] + boxes_coco[:, 3] * 0.5
     in_roi = (centers_x >= x1) & (centers_x <= x2) & (centers_y >= y1) & (centers_y <= y2)
     return boxes_coco[in_roi]
+
+
+def box_iou_xywh(first_box: np.ndarray, second_box: np.ndarray) -> float:
+    """Calculate overlap between two boxes. Look up: Intersection over Union."""
+    first_x1, first_y1, first_w, first_h = first_box
+    second_x1, second_y1, second_w, second_h = second_box
+    first_x2 = first_x1 + first_w
+    first_y2 = first_y1 + first_h
+    second_x2 = second_x1 + second_w
+    second_y2 = second_y1 + second_h
+
+    overlap_x1 = max(first_x1, second_x1)
+    overlap_y1 = max(first_y1, second_y1)
+    overlap_x2 = min(first_x2, second_x2)
+    overlap_y2 = min(first_y2, second_y2)
+    overlap_w = max(0.0, overlap_x2 - overlap_x1)
+    overlap_h = max(0.0, overlap_y2 - overlap_y1)
+    overlap_area = overlap_w * overlap_h
+
+    first_area = max(0.0, first_w) * max(0.0, first_h)
+    second_area = max(0.0, second_w) * max(0.0, second_h)
+    union_area = first_area + second_area - overlap_area
+    if union_area <= 0.0:
+        return 0.0
+    return float(overlap_area / union_area)
+
+
+def smooth_boxes(
+    previous_boxes: np.ndarray,
+    detected_boxes: np.ndarray,
+    smoothing: float,
+    min_iou: float = 0.15,
+) -> np.ndarray:
+    """Smooth matching boxes from frame to frame so skeletons jump less."""
+    if smoothing <= 0.0 or len(previous_boxes) == 0 or len(detected_boxes) == 0:
+        return detected_boxes
+
+    smoothing = min(max(smoothing, 0.0), 0.95)
+    smoothed_boxes = detected_boxes.copy()
+    used_previous_indexes: set[int] = set()
+
+    for detected_index, detected_box in enumerate(detected_boxes):
+        best_iou = 0.0
+        best_previous_index = -1
+        for previous_index, previous_box in enumerate(previous_boxes):
+            if previous_index in used_previous_indexes:
+                continue
+            iou = box_iou_xywh(previous_box, detected_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_previous_index = previous_index
+
+        if best_previous_index >= 0 and best_iou >= min_iou:
+            used_previous_indexes.add(best_previous_index)
+            previous_box = previous_boxes[best_previous_index]
+            smoothed_boxes[detected_index] = smoothing * previous_box + (1.0 - smoothing) * detected_box
+
+    return smoothed_boxes
 
 
 def add_extra_boxes(boxes_coco: np.ndarray, extra_boxes: list[np.ndarray], max_people: int) -> np.ndarray:
@@ -358,14 +420,14 @@ def main() -> None:
         raise ValueError("--detector-stride must be >= 1")
     if args.pose_stride < 1:
         raise ValueError("--pose-stride must be >= 1")
-    if args.box_preset == "concert-video":
-        args.extra_person_box = list(DEFAULT_CONCERT_VIDEO_BOXES) + args.extra_person_box
+    if not 0.0 <= args.box_smoothing <= 0.95:
+        raise ValueError("--box-smoothing must be between 0 and 0.95")
 
     device = select_device(args.device)
     detector_processor = None
     detector = None
     if args.skip_detector:
-        print("Skipping detector and using calibrated performer boxes.")
+        print("Skipping detector and using only boxes passed with --extra-person-box.")
     else:
         print(f"Loading detector {args.detector_model} on {device}...")
         detector_processor = AutoImageProcessor.from_pretrained(args.detector_model)
@@ -392,8 +454,9 @@ def main() -> None:
     last_boxes = np.empty((0, 4), dtype=np.float32)
     last_boxes_original = np.empty((0, 4), dtype=np.float32)
     last_poses_original: list[dict[str, torch.Tensor]] = []
+    frame_times: list[float] = []
     frame_index = 0
-    started_at = time.time()
+    started_at = time.perf_counter()
 
     while True:
         ok, frame_bgr = capture.read()
@@ -402,6 +465,7 @@ def main() -> None:
         if args.limit_frames and frame_index >= args.limit_frames:
             break
 
+        frame_started_at = time.perf_counter()
         inference_bgr, scale_x, scale_y = resize_for_inference(frame_bgr, args.inference_width)
         inference_height, inference_width = inference_bgr.shape[:2]
         frame_rgb_array = cv2.cvtColor(inference_bgr, cv2.COLOR_BGR2RGB)
@@ -419,7 +483,7 @@ def main() -> None:
             else:
                 if detector_processor is None or detector is None:
                     raise RuntimeError("Detector is not loaded.")
-                last_boxes = detect_people(
+                detected_boxes = detect_people(
                     frame_rgb,
                     detector_processor,
                     detector,
@@ -427,8 +491,9 @@ def main() -> None:
                     args.person_threshold,
                     args.max_people,
                 )
-                last_boxes = filter_boxes_to_roi(last_boxes, roi)
-                last_boxes = add_extra_boxes(last_boxes, extra_boxes, args.max_people)
+                detected_boxes = filter_boxes_to_roi(detected_boxes, roi)
+                detected_boxes = add_extra_boxes(detected_boxes, extra_boxes, args.max_people)
+                last_boxes = smooth_boxes(last_boxes, detected_boxes, args.box_smoothing)
 
         if should_update_pose:
             poses = estimate_pose(frame_rgb, last_boxes, pose_processor, pose_model, device)
@@ -445,18 +510,30 @@ def main() -> None:
         writer.write(annotated)
 
         frame_index += 1
+        frame_elapsed = time.perf_counter() - frame_started_at
+        frame_times.append(frame_elapsed)
+        print(f"Frame {frame_index}/{total_frames or '?'} generated in {frame_elapsed:.3f}s.")
         if frame_index % 25 == 0:
-            elapsed = max(time.time() - started_at, 1e-6)
+            elapsed = max(time.perf_counter() - started_at, 1e-6)
             print(f"Processed {frame_index}/{total_frames or '?'} frames ({frame_index / elapsed:.2f} fps).")
 
     capture.release()
     writer.release()
-    total_elapsed = time.time() - started_at
+    total_elapsed = time.perf_counter() - started_at
+    average_frame_time = sum(frame_times) / len(frame_times) if frame_times else 0.0
+    min_frame_time = min(frame_times) if frame_times else 0.0
+    max_frame_time = max(frame_times) if frame_times else 0.0
     print(f"Done. Wrote annotated video to {args.output}")
     print(
         "Timing summary: "
         f"{frame_index} frames in {format_duration(total_elapsed)} "
         f"({total_elapsed:.2f}s, {frame_index / max(total_elapsed, 1e-6):.2f} fps average)."
+    )
+    print(
+        "Per-frame timing: "
+        f"average {average_frame_time:.3f}s, "
+        f"min {min_frame_time:.3f}s, "
+        f"max {max_frame_time:.3f}s."
     )
 
 
