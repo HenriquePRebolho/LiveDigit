@@ -455,6 +455,7 @@ def main() -> None:
     last_boxes_original = np.empty((0, 4), dtype=np.float32)
     last_poses_original: list[dict[str, torch.Tensor]] = []
     frame_times: list[float] = []
+    skeleton_stage_times: list[float] = []
     frame_index = 0
     started_at = time.perf_counter()
 
@@ -495,6 +496,10 @@ def main() -> None:
                 detected_boxes = add_extra_boxes(detected_boxes, extra_boxes, args.max_people)
                 last_boxes = smooth_boxes(last_boxes, detected_boxes, args.box_smoothing)
 
+        # This second timer starts after the D-FINE person-detection section.
+        # It measures only the skeleton-related part: pose estimation, scaling,
+        # and drawing. On skipped frames it measures drawing the reused skeleton.
+        skeleton_stage_started_at = time.perf_counter()
         if should_update_pose:
             poses = estimate_pose(frame_rgb, last_boxes, pose_processor, pose_model, device)
             last_boxes_original = scale_boxes(last_boxes, scale_x, scale_y)
@@ -507,12 +512,18 @@ def main() -> None:
             args.keypoint_threshold,
             args.draw_boxes,
         )
+        skeleton_stage_elapsed = time.perf_counter() - skeleton_stage_started_at
+        skeleton_stage_times.append(skeleton_stage_elapsed)
         writer.write(annotated)
 
         frame_index += 1
         frame_elapsed = time.perf_counter() - frame_started_at
         frame_times.append(frame_elapsed)
         print(f"Frame {frame_index}/{total_frames or '?'} generated in {frame_elapsed:.3f}s.")
+        print(
+            f"  Skeleton stage after D-FINE: {skeleton_stage_elapsed:.3f}s "
+            f"({'updated pose' if should_update_pose else 'reused previous pose'})."
+        )
         if frame_index % 25 == 0:
             elapsed = max(time.perf_counter() - started_at, 1e-6)
             print(f"Processed {frame_index}/{total_frames or '?'} frames ({frame_index / elapsed:.2f} fps).")
@@ -523,6 +534,9 @@ def main() -> None:
     average_frame_time = sum(frame_times) / len(frame_times) if frame_times else 0.0
     min_frame_time = min(frame_times) if frame_times else 0.0
     max_frame_time = max(frame_times) if frame_times else 0.0
+    average_skeleton_stage_time = sum(skeleton_stage_times) / len(skeleton_stage_times) if skeleton_stage_times else 0.0
+    min_skeleton_stage_time = min(skeleton_stage_times) if skeleton_stage_times else 0.0
+    max_skeleton_stage_time = max(skeleton_stage_times) if skeleton_stage_times else 0.0
     print(f"Done. Wrote annotated video to {args.output}")
     print(
         "Timing summary: "
@@ -534,6 +548,12 @@ def main() -> None:
         f"average {average_frame_time:.3f}s, "
         f"min {min_frame_time:.3f}s, "
         f"max {max_frame_time:.3f}s."
+    )
+    print(
+        "Skeleton-stage timing after D-FINE: "
+        f"average {average_skeleton_stage_time:.3f}s, "
+        f"min {min_skeleton_stage_time:.3f}s, "
+        f"max {max_skeleton_stage_time:.3f}s."
     )
 
 
