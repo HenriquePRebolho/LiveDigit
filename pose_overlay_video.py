@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 from pathlib import Path
 
@@ -9,6 +10,11 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoImageProcessor, AutoProcessor, DFineForObjectDetection, VitPoseForPoseEstimation
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 
 COCO_KEYPOINT_EDGES = (
@@ -33,6 +39,52 @@ COCO_KEYPOINT_EDGES = (
 # Leave empty by default because the camera may move or zoom. If a future camera
 # is fixed, you can still pass --stage-roi to ignore audience areas.
 DEFAULT_STAGE_ROI = ""
+
+YOLO_MODEL_PATH = Path("bounding_boxes") / "testing" / "yoloe-26x-seg-pf.pt"
+YOLO_PERSON_CLASS_ID = 2163
+YOLO_PERFORMER_CLASS_IDS = (
+    322,  # bassist
+    1424,  # drummer
+    1977,  # guitarist
+    2758,  # musician
+    3526,  # saxophonist
+    4369,  # violinist
+    4370,  # violist
+)
+YOLO_INSTRUMENT_CONTEXT_CLASS_IDS = (
+    9,  # accordion
+    263,  # banjo
+    319,  # bass
+    320,  # bass guitar
+    321,  # bass horn
+    519,  # boom microphone
+    808,  # cello
+    947,  # clarinet
+    1026,  # keyboard
+    1125,  # trumpet
+    1244,  # cymbal
+    1423,  # drum
+    1425,  # drumstick
+    1476,  # electric guitar
+    1711,  # flute
+    1976,  # guitar
+    2632,  # microphone
+    2757,  # musical keyboard
+    3038,  # piano
+    3525,  # sax
+    4270,  # trombone
+    4309,  # ukulele
+    4368,  # violin
+)
+YOLO_RELEVANT_CLASS_IDS = (
+    2163,  # person
+    *YOLO_PERFORMER_CLASS_IDS,
+    *YOLO_INSTRUMENT_CONTEXT_CLASS_IDS,
+)
+YOLO_BODY_CLASS_IDS = (
+    YOLO_PERSON_CLASS_ID,
+    *YOLO_PERFORMER_CLASS_IDS,
+)
 
 KEYPOINT_COLORS = (
     (0, 255, 255),
@@ -75,6 +127,38 @@ def parse_args() -> argparse.Namespace:
         "--detector-model",
         default="ustc-community/dfine-small-coco",
         help="Hugging Face object detector. D-FINE COCO checkpoints are Apache-2.0.",
+    )
+    parser.add_argument(
+        "--box-source",
+        choices=("dfine", "yolo", "compare"),
+        default="dfine",
+        help=(
+            "Bounding-box source for ViTPose. 'compare' runs D-FINE and YOLO separately and prints metrics for both."
+        ),
+    )
+    parser.add_argument(
+        "--yolo-model",
+        type=Path,
+        default=YOLO_MODEL_PATH,
+        help="YOLO model path used when --box-source is yolo or compare.",
+    )
+    parser.add_argument(
+        "--yolo-imgsz",
+        type=int,
+        default=1088,
+        help="YOLO inference image size. Smaller is faster; larger can improve small-person detection.",
+    )
+    parser.add_argument(
+        "--yolo-threshold",
+        type=float,
+        default=0.2,
+        help="YOLO confidence threshold for musician/person boxes.",
+    )
+    parser.add_argument(
+        "--comparison-report",
+        type=Path,
+        default=Path("output") / "box_source_comparison.csv",
+        help="CSV report path written when --box-source compare is used.",
     )
     parser.add_argument(
         "--pose-model",
@@ -239,6 +323,90 @@ def box_iou_xywh(first_box: np.ndarray, second_box: np.ndarray) -> float:
     return float(overlap_area / union_area)
 
 
+def expand_box_xywh(box: np.ndarray, image_width: int, image_height: int, scale: float) -> np.ndarray:
+    """Expand a box around its center while keeping it inside the image."""
+    x_coord, y_coord, width, height = box
+    center_x = x_coord + width * 0.5
+    center_y = y_coord + height * 0.5
+    new_width = width * scale
+    new_height = height * scale
+    new_x = max(0.0, center_x - new_width * 0.5)
+    new_y = max(0.0, center_y - new_height * 0.5)
+    new_width = min(new_width, image_width - new_x)
+    new_height = min(new_height, image_height - new_y)
+    return np.array([new_x, new_y, max(new_width, 1.0), max(new_height, 1.0)], dtype=np.float32)
+
+
+def instrument_box_to_person_hint(box: np.ndarray, image_width: int, image_height: int) -> np.ndarray:
+    """Estimate a loose person crop from an instrument/context box when YOLO misses the body class."""
+    x_coord, y_coord, width, height = box
+    center_x = x_coord + width * 0.5
+    center_y = y_coord + height * 0.35
+    new_width = max(width * 2.4, height * 1.2)
+    new_height = max(height * 3.2, width * 1.7)
+    new_x = min(max(0.0, center_x - new_width * 0.5), max(0.0, image_width - 1.0))
+    new_y = min(max(0.0, center_y - new_height * 0.35), max(0.0, image_height - 1.0))
+    new_width = min(new_width, image_width - new_x)
+    new_height = min(new_height, image_height - new_y)
+    return np.array([new_x, new_y, max(new_width, 1.0), max(new_height, 1.0)], dtype=np.float32)
+
+
+def best_context_overlap(person_box: np.ndarray, context_boxes: np.ndarray) -> float:
+    """Return the strongest overlap between a person box and any instrument-context box."""
+    if len(context_boxes) == 0:
+        return 0.0
+    return max(box_iou_xywh(person_box, context_box) for context_box in context_boxes)
+
+
+def box_center_xy(box: np.ndarray) -> tuple[float, float]:
+    x_coord, y_coord, width, height = box
+    return float(x_coord + width * 0.5), float(y_coord + height * 0.5)
+
+
+def point_inside_box(point_x: float, point_y: float, box: np.ndarray) -> bool:
+    x_coord, y_coord, width, height = box
+    return x_coord <= point_x <= x_coord + width and y_coord <= point_y <= y_coord + height
+
+
+def best_context_association(person_box: np.ndarray, context_boxes: np.ndarray, image_width: int, image_height: int) -> float:
+    """Score how likely a body box belongs to nearby instrument/microphone detections."""
+    if len(context_boxes) == 0:
+        return 0.0
+
+    expanded_person = expand_box_xywh(person_box, image_width, image_height, 1.45)
+    person_cx, person_cy = box_center_xy(person_box)
+    person_scale = max(np.sqrt(max(person_box[2] * person_box[3], 1.0)), 1.0)
+    best_score = 0.0
+
+    for context_box in context_boxes:
+        context_cx, context_cy = box_center_xy(context_box)
+        context_scale = max(np.sqrt(max(context_box[2] * context_box[3], 1.0)), 1.0)
+        distance = np.hypot(person_cx - context_cx, person_cy - context_cy)
+        distance_limit = max(person_scale * 0.85 + context_scale * 0.85, 1.0)
+        distance_score = max(0.0, 1.0 - distance / distance_limit)
+        overlap_score = min(box_iou_xywh(expanded_person, context_box) * 4.0, 1.0)
+        inside_score = 1.0 if point_inside_box(context_cx, context_cy, expanded_person) else 0.0
+        best_score = max(best_score, overlap_score, distance_score, inside_score)
+
+    return float(best_score)
+
+
+def dedupe_ranked_boxes(boxes: np.ndarray, scores: np.ndarray, max_boxes: int, iou_threshold: float = 0.45) -> np.ndarray:
+    if len(boxes) == 0:
+        return np.empty((0, 4), dtype=np.float32)
+
+    selected_boxes: list[np.ndarray] = []
+    for index in np.argsort(scores)[::-1]:
+        box = boxes[index]
+        if any(box_iou_xywh(box, selected_box) >= iou_threshold for selected_box in selected_boxes):
+            continue
+        selected_boxes.append(box)
+        if len(selected_boxes) >= max_boxes:
+            break
+
+    return np.array(selected_boxes, dtype=np.float32) if selected_boxes else np.empty((0, 4), dtype=np.float32)
+
+
 def smooth_boxes(
     previous_boxes: np.ndarray,
     detected_boxes: np.ndarray,
@@ -334,6 +502,91 @@ def detect_people(
     return to_coco_boxes(results["boxes"][person_mask], scores[person_mask], max_people)
 
 
+def detect_yolo_musicians(
+    frame_rgb: Image.Image,
+    yolo_model: object,
+    threshold: float,
+    max_people: int,
+    image_size: int,
+    device: torch.device,
+) -> np.ndarray:
+    """Use the YOLO model from bounding_boxes/testing to find musician/person boxes."""
+    # The reference bounding_boxes/testing scripts pass OpenCV BGR frames to Ultralytics.
+    frame_array = cv2.cvtColor(np.asarray(frame_rgb), cv2.COLOR_RGB2BGR)
+    results = yolo_model(
+        frame_array,
+        imgsz=image_size,
+        classes=list(YOLO_RELEVANT_CLASS_IDS),
+        conf=threshold,
+        device=str(device),
+        verbose=False,
+    )
+    if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+        return np.empty((0, 4), dtype=np.float32)
+
+    boxes_xyxy = results[0].boxes.xyxy.detach().cpu().numpy().astype(np.float32)
+    scores = results[0].boxes.conf.detach().cpu().numpy()
+    class_ids = results[0].boxes.cls.detach().cpu().numpy().astype(np.int32)
+
+    boxes_coco = boxes_xyxy.copy()
+    boxes_coco[:, 2] = boxes_coco[:, 2] - boxes_coco[:, 0]
+    boxes_coco[:, 3] = boxes_coco[:, 3] - boxes_coco[:, 1]
+    boxes_coco[:, 2:] = np.maximum(boxes_coco[:, 2:], 1.0)
+
+    body_mask = np.isin(class_ids, YOLO_BODY_CLASS_IDS)
+    context_mask = np.isin(class_ids, YOLO_INSTRUMENT_CONTEXT_CLASS_IDS)
+    body_boxes = boxes_coco[body_mask]
+    body_scores = scores[body_mask]
+    body_class_ids = class_ids[body_mask]
+    context_boxes = boxes_coco[context_mask]
+    context_scores = scores[context_mask]
+
+    candidate_boxes: list[np.ndarray] = []
+    candidate_scores: list[np.ndarray] = []
+
+    if len(body_boxes) > 0:
+        context_associations = np.array(
+            [
+                best_context_association(box, context_boxes, frame_rgb.width, frame_rgb.height)
+                for box in body_boxes
+            ],
+            dtype=np.float32,
+        )
+        performer_boost = np.isin(body_class_ids, YOLO_PERFORMER_CLASS_IDS).astype(np.float32) * 1.5
+        y_bottom = body_boxes[:, 1] + body_boxes[:, 3]
+        foreground_audience_penalty = (
+            (context_associations < 0.05)
+            & (body_class_ids == YOLO_PERSON_CLASS_ID)
+            & (y_bottom > frame_rgb.height * 0.82)
+        ).astype(np.float32) * 0.75
+        musician_scores = body_scores + performer_boost + context_associations * 2.0 - foreground_audience_penalty
+
+        if len(context_boxes) > 0:
+            musician_mask = (context_associations >= 0.05) | np.isin(body_class_ids, YOLO_PERFORMER_CLASS_IDS)
+            if np.any(musician_mask):
+                body_boxes = body_boxes[musician_mask]
+                musician_scores = musician_scores[musician_mask]
+
+        candidate_boxes.append(body_boxes)
+        candidate_scores.append(musician_scores)
+
+    if len(context_boxes) > 0:
+        hinted_boxes = np.array(
+            [instrument_box_to_person_hint(box, frame_rgb.width, frame_rgb.height) for box in context_boxes],
+            dtype=np.float32,
+        )
+        hinted_scores = context_scores + 1.0
+        candidate_boxes.append(hinted_boxes)
+        candidate_scores.append(hinted_scores)
+
+    if not candidate_boxes:
+        return np.empty((0, 4), dtype=np.float32)
+
+    all_candidate_boxes = np.vstack(candidate_boxes).astype(np.float32)
+    all_candidate_scores = np.concatenate(candidate_scores).astype(np.float32)
+    return dedupe_ranked_boxes(all_candidate_boxes, all_candidate_scores, max_people)
+
+
 def estimate_pose(
     frame_rgb: Image.Image,
     boxes_coco: np.ndarray,
@@ -412,22 +665,31 @@ def format_duration(seconds: float) -> str:
     return f"{seconds:d}s"
 
 
-def main() -> None:
-    args = parse_args()
+def run_pipeline(args: argparse.Namespace, box_source: str, output_path: Path) -> dict[str, float]:
     if not args.input.exists():
         raise FileNotFoundError(f"Input video not found: {args.input}")
     if args.detector_stride < 1:
         raise ValueError("--detector-stride must be >= 1")
     if args.pose_stride < 1:
         raise ValueError("--pose-stride must be >= 1")
+    if args.limit_frames < 0:
+        raise ValueError("--limit-frames must be >= 0")
     if not 0.0 <= args.box_smoothing <= 0.95:
         raise ValueError("--box-smoothing must be between 0 and 0.95")
+    if box_source == "yolo" and YOLO is None:
+        raise ImportError("ultralytics is required for --box-source yolo. Install it with: pip install ultralytics")
+    if box_source == "yolo" and not args.yolo_model.exists():
+        raise FileNotFoundError(f"YOLO model not found: {args.yolo_model}")
 
     device = select_device(args.device)
     detector_processor = None
     detector = None
+    yolo_model = None
     if args.skip_detector:
         print("Skipping detector and using only boxes passed with --extra-person-box.")
+    elif box_source == "yolo":
+        print(f"Loading YOLO box model {args.yolo_model}...")
+        yolo_model = YOLO(str(args.yolo_model))
     else:
         print(f"Loading detector {args.detector_model} on {device}...")
         detector_processor = AutoImageProcessor.from_pretrained(args.detector_model)
@@ -445,25 +707,32 @@ def main() -> None:
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    frame_goal = min(args.limit_frames, total_frames) if args.limit_frames and total_frames else args.limit_frames or total_frames
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    writer = cv2.VideoWriter(str(args.output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     if not writer.isOpened():
-        raise RuntimeError(f"Could not open output video writer: {args.output}")
+        raise RuntimeError(f"Could not open output video writer: {output_path}")
 
     last_boxes = np.empty((0, 4), dtype=np.float32)
     last_boxes_original = np.empty((0, 4), dtype=np.float32)
     last_poses_original: list[dict[str, torch.Tensor]] = []
     frame_times: list[float] = []
     skeleton_stage_times: list[float] = []
+    detection_times: list[float] = []
+    pose_update_counts: list[int] = []
+    valid_keypoint_counts: list[int] = []
+    keypoint_confidences: list[float] = []
     frame_index = 0
     started_at = time.perf_counter()
+    print(f"Running pipeline with {box_source.upper()} bounding boxes.")
 
     while True:
+        if args.limit_frames and frame_index >= args.limit_frames:
+            break
+
         ok, frame_bgr = capture.read()
         if not ok:
-            break
-        if args.limit_frames and frame_index >= args.limit_frames:
             break
 
         frame_started_at = time.perf_counter()
@@ -482,26 +751,47 @@ def main() -> None:
             if args.skip_detector:
                 last_boxes = add_extra_boxes(np.empty((0, 4), dtype=np.float32), extra_boxes, args.max_people)
             else:
-                if detector_processor is None or detector is None:
-                    raise RuntimeError("Detector is not loaded.")
-                detected_boxes = detect_people(
-                    frame_rgb,
-                    detector_processor,
-                    detector,
-                    device,
-                    args.person_threshold,
-                    args.max_people,
-                )
+                detection_started_at = time.perf_counter()
+                if box_source == "yolo":
+                    if yolo_model is None:
+                        raise RuntimeError("YOLO model is not loaded.")
+                    detected_boxes = detect_yolo_musicians(
+                        frame_rgb,
+                        yolo_model,
+                        args.yolo_threshold,
+                        args.max_people,
+                        args.yolo_imgsz,
+                        device,
+                    )
+                else:
+                    if detector_processor is None or detector is None:
+                        raise RuntimeError("Detector is not loaded.")
+                    detected_boxes = detect_people(
+                        frame_rgb,
+                        detector_processor,
+                        detector,
+                        device,
+                        args.person_threshold,
+                        args.max_people,
+                    )
+                detection_times.append(time.perf_counter() - detection_started_at)
                 detected_boxes = filter_boxes_to_roi(detected_boxes, roi)
                 detected_boxes = add_extra_boxes(detected_boxes, extra_boxes, args.max_people)
                 last_boxes = smooth_boxes(last_boxes, detected_boxes, args.box_smoothing)
 
-        # This second timer starts after the D-FINE person-detection section.
+        # This second timer starts after the person/musician box-detection section.
         # It measures only the skeleton-related part: pose estimation, scaling,
         # and drawing. On skipped frames it measures drawing the reused skeleton.
         skeleton_stage_started_at = time.perf_counter()
         if should_update_pose:
             poses = estimate_pose(frame_rgb, last_boxes, pose_processor, pose_model, device)
+            pose_update_counts.append(len(poses))
+            for pose in poses:
+                scores = pose["scores"].detach().cpu().numpy()
+                confident_scores = scores[scores >= args.keypoint_threshold]
+                valid_keypoint_counts.append(int(len(confident_scores)))
+                if len(confident_scores) > 0:
+                    keypoint_confidences.append(float(np.mean(confident_scores)))
             last_boxes_original = scale_boxes(last_boxes, scale_x, scale_y)
             last_poses_original = scale_poses(poses, scale_x, scale_y)
 
@@ -519,14 +809,14 @@ def main() -> None:
         frame_index += 1
         frame_elapsed = time.perf_counter() - frame_started_at
         frame_times.append(frame_elapsed)
-        print(f"Frame {frame_index}/{total_frames or '?'} generated in {frame_elapsed:.3f}s.")
+        print(f"Frame {frame_index}/{frame_goal or '?'} generated in {frame_elapsed:.3f}s.")
         print(
-            f"  Skeleton stage after D-FINE: {skeleton_stage_elapsed:.3f}s "
+            f"  Skeleton stage after box detection: {skeleton_stage_elapsed:.3f}s "
             f"({'updated pose' if should_update_pose else 'reused previous pose'})."
         )
         if frame_index % 25 == 0:
             elapsed = max(time.perf_counter() - started_at, 1e-6)
-            print(f"Processed {frame_index}/{total_frames or '?'} frames ({frame_index / elapsed:.2f} fps).")
+            print(f"Processed {frame_index}/{frame_goal or '?'} frames ({frame_index / elapsed:.2f} fps).")
 
     capture.release()
     writer.release()
@@ -537,7 +827,13 @@ def main() -> None:
     average_skeleton_stage_time = sum(skeleton_stage_times) / len(skeleton_stage_times) if skeleton_stage_times else 0.0
     min_skeleton_stage_time = min(skeleton_stage_times) if skeleton_stage_times else 0.0
     max_skeleton_stage_time = max(skeleton_stage_times) if skeleton_stage_times else 0.0
-    print(f"Done. Wrote annotated video to {args.output}")
+    average_detection_time = sum(detection_times) / len(detection_times) if detection_times else 0.0
+    average_people_per_pose_update = sum(pose_update_counts) / len(pose_update_counts) if pose_update_counts else 0.0
+    average_valid_keypoints_per_person = (
+        sum(valid_keypoint_counts) / len(valid_keypoint_counts) if valid_keypoint_counts else 0.0
+    )
+    average_keypoint_confidence = sum(keypoint_confidences) / len(keypoint_confidences) if keypoint_confidences else 0.0
+    print(f"Done. Wrote annotated video to {output_path}")
     print(
         "Timing summary: "
         f"{frame_index} frames in {format_duration(total_elapsed)} "
@@ -550,11 +846,76 @@ def main() -> None:
         f"max {max_frame_time:.3f}s."
     )
     print(
-        "Skeleton-stage timing after D-FINE: "
+        "Skeleton-stage timing after box detection: "
         f"average {average_skeleton_stage_time:.3f}s, "
         f"min {min_skeleton_stage_time:.3f}s, "
         f"max {max_skeleton_stage_time:.3f}s."
     )
+    print(f"Box-detection timing ({box_source}): average {average_detection_time:.3f}s.")
+    print(
+        "Pose proxy metrics: "
+        f"average people per pose update {average_people_per_pose_update:.2f}, "
+        f"average valid keypoints per person {average_valid_keypoints_per_person:.2f}, "
+        f"average confident-keypoint score {average_keypoint_confidence:.3f}."
+    )
+
+    return {
+        "frames": float(frame_index),
+        "total_elapsed": total_elapsed,
+        "average_fps": frame_index / max(total_elapsed, 1e-6),
+        "average_frame_time": average_frame_time,
+        "min_frame_time": min_frame_time,
+        "max_frame_time": max_frame_time,
+        "average_skeleton_stage_time": average_skeleton_stage_time,
+        "min_skeleton_stage_time": min_skeleton_stage_time,
+        "max_skeleton_stage_time": max_skeleton_stage_time,
+        "average_detection_time": average_detection_time,
+        "average_people_per_pose_update": average_people_per_pose_update,
+        "average_valid_keypoints_per_person": average_valid_keypoints_per_person,
+        "average_keypoint_confidence": average_keypoint_confidence,
+    }
+
+
+def comparison_output_path(output_path: Path, suffix: str) -> Path:
+    return output_path.with_name(f"{output_path.stem}_{suffix}{output_path.suffix}")
+
+
+def print_comparison(dfine_stats: dict[str, float], yolo_stats: dict[str, float]) -> None:
+    print("\nComparison summary")
+    print("------------------")
+    metrics = (
+        ("Average FPS", "average_fps"),
+        ("Average frame time", "average_frame_time"),
+        ("Average box-detection time", "average_detection_time"),
+        ("Average skeleton-stage time", "average_skeleton_stage_time"),
+        ("Average people per pose update", "average_people_per_pose_update"),
+        ("Average valid keypoints per person", "average_valid_keypoints_per_person"),
+        ("Average confident-keypoint score", "average_keypoint_confidence"),
+    )
+    for label, key in metrics:
+        print(f"{label}: D-FINE={dfine_stats[key]:.3f} | YOLO={yolo_stats[key]:.3f}")
+
+
+def write_comparison_report(report_path: Path, dfine_stats: dict[str, float], yolo_stats: dict[str, float]) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["box_source", *dfine_stats.keys()]
+    with report_path.open("w", newline="", encoding="utf-8") as report_file:
+        writer = csv.DictWriter(report_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({"box_source": "dfine", **dfine_stats})
+        writer.writerow({"box_source": "yolo", **yolo_stats})
+    print(f"Wrote comparison report to {report_path}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.box_source == "compare":
+        dfine_stats = run_pipeline(args, "dfine", comparison_output_path(args.output, "dfine"))
+        yolo_stats = run_pipeline(args, "yolo", comparison_output_path(args.output, "yolo"))
+        print_comparison(dfine_stats, yolo_stats)
+        write_comparison_report(args.comparison_report, dfine_stats, yolo_stats)
+    else:
+        run_pipeline(args, args.box_source, args.output)
 
 
 if __name__ == "__main__":
